@@ -2,6 +2,7 @@
 import asyncio
 import json
 import sys
+import traceback
 
 import streamlit as st
 
@@ -20,6 +21,15 @@ EXAMPLES = [
     "Хочу ПК с RTX 4090 за 50 000 ₽",
 ]
 ICONS = {"retrieve": "📚", "llm": "🧠", "tool": "🔧", "finalize": "🏁", "mcp": "🔌"}
+
+
+def root_causes(e: BaseException):
+    """Разворачивает ExceptionGroup (anyio/MCP) до настоящих исключений."""
+    if isinstance(e, BaseExceptionGroup):
+        for sub in e.exceptions:
+            yield from root_causes(sub)
+    else:
+        yield e
 
 
 def pretty(text: str, limit: int = 1800) -> str:
@@ -94,14 +104,18 @@ if prompt:
 
     with st.chat_message("assistant"):
         status = st.status("Агент работает…", expanded=True)
+        answer, steps = "", []
         try:
             answer, steps = asyncio.run(
                 run_agent(prompt, llm_history, on_step=lambda s: render_step(s, status), model=model)
             )
             status.update(label=f"Готово: {len(steps)} шагов", state="complete", expanded=False)
         except Exception as e:
+            traceback.print_exc()  # полный traceback в консоль, где запущен Streamlit
             status.update(label="Ошибка", state="error")
-            answer, steps = f"⚠️ Ошибка: `{e}`. Проверьте, что Ollama запущена и выполнен build_index.", []
+            causes = "; ".join(f"{type(c).__name__}: {c}" for c in root_causes(e))
+            answer = f"⚠️ Ошибка: {causes}"
+            steps = []
         st.markdown(answer)
 
     st.session_state.history.append({"role": "user", "content": prompt})

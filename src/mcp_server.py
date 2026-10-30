@@ -4,6 +4,9 @@
     mcp dev src/mcp_server.py
 Важно: сервер общается через stdout, поэтому весь лог пишется в stderr.
 """
+
+import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
 import json
 import logging
 import re

@@ -5,11 +5,21 @@
     retrieve ──► build_prompt ──► llm ──┬──► tools ──► llm  (цикл, пока LLM вызывает инструменты)
                                         ├──► finalize ──► END  (лимит шагов или пустой ответ)
                                         └──► END              (готовый ответ)
+
+Изменения для маленьких моделей (qwen3:4b):
+  * num_predict ограничивает длину ответа, чтобы модель не зацикливалась;
+  * температура 0.7 вместо 0 (при 0 маленькие модели часто повторяют одно и то же);
+  * контекст не больше 6144, RAG-фрагментов не больше 3 (короче промпт, быстрее ответ);
+  * в терминал пишется лог каждого запроса к LLM;
+  * запасной парсер: если модель написала вызов инструмента текстом <tool_call>{...}</tool_call>,
+    он превращается в настоящий вызов.
 """
+import asyncio
 import json
 import os
 import re
 import sys
+import time
 from typing import Any, Callable, TypedDict
 
 import ollama
@@ -18,8 +28,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from .config import (
-    KNOWLEDGE_COLLECTION, LLM_MODEL, MAX_STEPS, NUM_CTX, OLLAMA_HOST, ROOT, TEMPERATURE, TOP_K,
+    KNOWLEDGE_COLLECTION, LLM_MODEL, MAX_STEPS, NUM_CTX, OLLAMA_HOST, ROOT, TOP_K,
 )
+
+# Настройки для слабого железа и маленьких моделей. При необходимости меняйте здесь.
+CTX_USED = min(NUM_CTX, 6144)   # размер контекста
+TOP_K_USED = min(TOP_K, 3)      # сколько фрагментов из базы знаний кладём в промпт
+NUM_PREDICT = 1024              # максимум токенов в одном ответе модели
+LLM_TEMPERATURE = 0.7
+LLM_TOP_P = 0.8
 
 SYSTEM_PROMPT = """Ты — ИИ-агент «Сборщик ПК». Ты подбираешь конфигурацию компьютера под задачу и бюджет пользователя.
 
@@ -40,6 +57,7 @@ SYSTEM_PROMPT = """Ты — ИИ-агент «Сборщик ПК». Ты под
 Правила:
 - Используй ТОЛЬКО id и цены, полученные от инструментов. Не придумывай комплектующие.
 - Все проверки совместимости и суммы делай инструментами, а не в уме.
+- Не вызывай один и тот же инструмент с теми же аргументами повторно.
 - Если задачу невозможно выполнить в рамках бюджета, честно объясни почему и предложи
   реалистичную альтернативу (другой бюджет или сниженные требования)."""
 
@@ -49,6 +67,10 @@ FINALIZE_PROMPT = (
 )
 
 StepCallback = Callable[[dict], None]
+
+
+def _log(text: str) -> None:
+    print(text, file=sys.stderr, flush=True)
 
 
 class AgentState(TypedDict):
@@ -90,6 +112,29 @@ def _strip_think(text: str) -> str:
     return re.sub(r"<think>.*?</think>", "", text or "", flags=re.S).strip()
 
 
+def _parse_text_tool_calls(text: str) -> list:
+    """Запасной вариант: достаёт вызовы вида <tool_call>{"name":..., "arguments":{...}}</tool_call>
+    из текста ответа, если модель не оформила их как настоящие tool_calls."""
+    calls = []
+    for raw in re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text or "", flags=re.S):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        name = data.get("name")
+        if not name:
+            continue
+        args = data.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        calls.append(ollama.Message.ToolCall(
+            function=ollama.Message.ToolCall.Function(name=name, arguments=args)))
+    return calls
+
+
 # ---------------------------------------------------------------- агент
 class PCBuildAgent:
     def __init__(self, session: ClientSession, tools: list[dict],
@@ -104,7 +149,7 @@ class PCBuildAgent:
             from .rag import HybridRetriever
             self.retriever = HybridRetriever(KNOWLEDGE_COLLECTION)
         except Exception as e:
-            print(f"[agent] RAG недоступен: {e}", file=sys.stderr)
+            _log(f"[agent] RAG недоступен: {e}")
             self.retriever = None
         self.graph = self._build_graph()
 
@@ -136,8 +181,11 @@ class PCBuildAgent:
         return fixed
 
     async def _chat(self, messages: list, use_tools: bool = True):
-        kwargs = dict(model=self.model, messages=messages,
-                      options={"num_ctx": NUM_CTX, "temperature": TEMPERATURE})
+        kwargs = dict(
+            model=self.model, messages=messages,
+            options={"num_ctx": CTX_USED, "temperature": LLM_TEMPERATURE,
+                     "top_p": LLM_TOP_P, "num_predict": NUM_PREDICT},
+        )
         if use_tools:
             kwargs["tools"] = self.tools
         try:
@@ -149,7 +197,7 @@ class PCBuildAgent:
 
     # --- узлы графа
     async def retrieve(self, state: AgentState) -> dict:
-        context = self.retriever.search(state["question"], k=TOP_K) if self.retriever else []
+        context = self.retriever.search(state["question"], k=TOP_K_USED) if self.retriever else []
         step = {"type": "retrieve", "sources": [c["source"] for c in context],
                 "fragments": [c["text"][:300] for c in context]}
         return {"context": context, "steps": self._step(state, step)}
@@ -164,11 +212,25 @@ class PCBuildAgent:
         return {"messages": messages}
 
     async def call_llm(self, state: AgentState) -> dict:
+        step_no = state["iterations"] + 1
+        t0 = time.time()
+        _log(f"[llm] запрос к модели {self.model}, шаг {step_no}")
         response = await self._chat(state["messages"])
         msg = response.message
+
+        # Запасной парсер: модель написала вызов текстом, а не как tool_call
+        if not msg.tool_calls and msg.content and "<tool_call>" in msg.content:
+            parsed = _parse_text_tool_calls(msg.content)
+            if parsed:
+                _log(f"[llm] tool_call найден в тексте ответа: {len(parsed)} шт.")
+                msg = ollama.Message(role="assistant", content="", tool_calls=parsed)
+
+        _log(f"[llm] ответ за {time.time() - t0:.1f} c; tool_calls={len(msg.tool_calls or [])}; "
+             f"текст: {(msg.content or '')[:200]!r}")
+
         calls = [{"name": tc.function.name, "args": dict(tc.function.arguments or {})}
                  for tc in (msg.tool_calls or [])]
-        update = {"messages": state["messages"] + [msg], "iterations": state["iterations"] + 1,
+        update = {"messages": state["messages"] + [msg], "iterations": step_no,
                   "answer": _strip_think(msg.content)}
         if calls:
             update["steps"] = self._step(state, {"type": "llm", "tool_calls": calls,
@@ -181,8 +243,10 @@ class PCBuildAgent:
         for tc in last.tool_calls or []:
             name = tc.function.name
             args = self._fix_args(name, dict(tc.function.arguments or {}))
+            _log(f"[tool] {name} {args}")
             try:
-                result = await self.session.call_tool(name, args)
+                result = await asyncio.wait_for(self.session.call_tool(name, args), timeout=300)
+                _log(f"[tool] {name}: готово")
                 text = "\n".join(c.text for c in result.content if getattr(c, "text", None))
                 if result.isError:
                     text = json.dumps({"error": text}, ensure_ascii=False)
@@ -197,6 +261,7 @@ class PCBuildAgent:
 
     async def finalize(self, state: AgentState) -> dict:
         messages = state["messages"] + [{"role": "user", "content": FINALIZE_PROMPT}]
+        _log("[llm] финальный ответ")
         response = await self._chat(messages, use_tools=False)
         step = {"type": "finalize", "reason": "лимит шагов" if state["iterations"] >= MAX_STEPS else "пустой ответ"}
         return {"answer": _strip_think(response.message.content), "steps": self._step(state, step)}
